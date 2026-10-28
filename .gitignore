@@ -1,0 +1,25 @@
+# secrets and local config - never commit
+.env
+.env.*
+config.local.*
+config.local/
+secrets/
+*.key
+*.pem
+tokens.*
+# runtime data
+*.db
+*.sqlite*
+queue/
+logs/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# node
+node_modules/
+# os / editor
+.DS_Store
+Thumbs.db
+.obsidian/workspace*.json
