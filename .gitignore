@@ -3,3 +3,25 @@ __pycache__/
 *.pyc
 config.json
 .env
+# secrets and local config - never commit
+.env.*
+config.local.*
+config.local/
+secrets/
+*.key
+*.pem
+tokens.*
+# runtime data
+*.db
+*.sqlite*
+queue/
+logs/
+# python
+.venv/
+venv/
+# node
+node_modules/
+# os / editor
+.DS_Store
+Thumbs.db
+.obsidian/workspace*.json
