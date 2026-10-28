@@ -27,6 +27,7 @@ from pathlib import Path
 
 import setup_harness as setup
 
+VERSION = "0.5 (merge-fix, own-file autocommit)"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_REMOTE = "https://github.com/0comp/Insane-harness-thing.git"
 MAX_ATTEMPTS = 3
@@ -40,7 +41,9 @@ SECRET_PATTERNS = {
     "discord token": r"[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}",
     "hardcoded secret": r"(?i)(api[_-]?key|token|secret|password)\s*=\s*[\"'][^\"']{16,}[\"']",
 }
-FILE_RE = re.compile(r"=== FILE: (\S+) ===\r?\n(.*?)\r?\n=== END FILE ===", re.DOTALL)
+HEADER_RE = re.compile(r"^[ \t>#*`=_-]*FILE:?[ \t]*[`*]*([A-Za-z0-9_]+\.py)[`*]*[ \t=*_#-]*$",
+                       re.MULTILINE | re.IGNORECASE)
+FENCE_RE = re.compile(r"```[A-Za-z0-9_+-]*\n(.*?)\n```", re.DOTALL)
 
 
 class TicketError(Exception):
@@ -91,14 +94,35 @@ def strip_think(text):
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
 
-def unfence(content):
-    content = content.strip("\n")
-    m = re.fullmatch(r"```[a-zA-Z]*\n(.*?)\n```", content, re.DOTALL)
-    return (m.group(1) if m else content) + "\n"
+def clean_content(content):
+    """Drop end markers, markdown fences and blank edges around one file's text."""
+    lines = content.strip("\n").split("\n")
+    junk = re.compile(r"[ \t=*_#-]*END FILE[ \t=*_#-]*|\s*```\s*|\s*", re.IGNORECASE)
+    while lines and junk.fullmatch(lines[-1]):
+        lines.pop()
+    if lines and re.fullmatch(r"\s*```[A-Za-z0-9_+-]*\s*", lines[0]):
+        lines.pop(0)
+    while lines and re.fullmatch(r"\s*```\s*|\s*", lines[-1]):
+        lines.pop()
+    return "\n".join(lines) + "\n"
 
 
 def parse_files(response):
-    return {n: unfence(c) for n, c in FILE_RE.findall(strip_think(response))}
+    """Accepts '=== FILE: x.py ===' blocks (end marker optional, fences tolerated); falls back to
+    fenced code blocks whose preceding line names a .py file."""
+    text = strip_think(response)
+    heads = list(HEADER_RE.finditer(text))
+    files = {}
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        files[m.group(1)] = clean_content(text[m.end():end])
+    if files:
+        return files
+    for m in FENCE_RE.finditer(text):
+        named = re.findall(r"([A-Za-z0-9_]+\.py)", text[max(0, m.start() - 150):m.start()])
+        if named:
+            files[named[-1]] = clean_content(m.group(1))
+    return files
 
 
 def scan_secrets(text):
@@ -240,7 +264,8 @@ class Builder:
 
     # git helpers
     def run_git(self, *args):
-        return subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True)
+        return subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
 
     def git(self, *args):
         r = self.run_git(*args)
@@ -298,7 +323,7 @@ class Builder:
             f"EXISTING CODE YOU MAY IMPORT (do not rewrite it):\n{self.context(t)}\n\n"
             f"TICKET {t['id']}: {t['title']}\n{t['body']}\n\n"
             f"Write exactly these files: {', '.join(t['files'])}\n"
-            "Output ONLY this format, one block per file, no other text:\n"
+            "Output ONLY this format, one block per file, no markdown fences, no other text:\n"
             "=== FILE: name.py ===\n<full file content>\n=== END FILE ===\n"
         )
         if error:
@@ -310,7 +335,8 @@ class Builder:
         if set(files) - allowed:
             raise TicketError(f"files not in ticket: {sorted(set(files) - allowed)}")
         if allowed - set(files):
-            raise TicketError(f"missing files: {sorted(allowed - set(files))}")
+            wrote = sorted(files) or "no recognisable file blocks"
+            raise TicketError(f"missing files: {sorted(allowed - set(files))}; you wrote: {wrote}")
         for name, content in files.items():
             hits = scan_secrets(content)
             if hits:
@@ -359,12 +385,75 @@ class Builder:
             self.git("add", *files)
             self.git("commit", "-m", "Bootstrap: setup script, self-build loop, tickets")
             self.say("Bootstrap commit made on main.")
+        self.git("checkout", "main")
+        own = [f for f in BOOTSTRAP + ["tickets"] if (self.root / f).exists()]
+        self.git("add", *own)
+        if self.run_git("diff", "--cached", "--quiet").returncode:  # changed, e.g. a new zip was unpacked
+            self.git("commit", "-m", "Update selfbuild files")
+            self.say("Committed updated selfbuild files to main.")
         if self.push:
             if self.run_git("remote", "get-url", "origin").returncode:
                 self.git("remote", "add", "origin", self.cfg.get("github_repo", DEFAULT_REMOTE))
             r = self.run_git("push", "-u", "origin", "main")
+            if r.returncode != 0 and re.search(r"rejected|fetch first|non-fast-forward", r.stderr):
+                r = self.sync_with_remote()
             self.say("Pushed main." if r.returncode == 0 else
                      f"Could not push main (continuing locally): {r.stderr.strip()[:300]}")
+
+    def resolve_add_add(self):
+        """Both sides added the same file (e.g. .gitignore, README.md): keep both, lose nothing.
+        Returns False, leaving the merge untouched, for any other kind of conflict."""
+        r = self.run_git("status", "--porcelain")
+        unmerged = [ln for ln in r.stdout.splitlines() if ln[:2] in ("AA", "DD", "AU", "UA", "UD", "DU", "UU")]
+        if not unmerged or any(ln[:2] != "AA" for ln in unmerged):
+            return False
+        for ln in unmerged:
+            path = ln[3:].strip().strip('"')
+            ours = self.run_git("show", f":2:{path}").stdout
+            theirs = self.run_git("show", f":3:{path}").stdout
+            extra = None
+            if path == ".gitignore":  # union of both, no duplicate lines
+                out, seen = [], set()
+                for line in ours.splitlines() + theirs.splitlines():
+                    if line.strip() and line in seen:
+                        continue
+                    seen.add(line)
+                    out.append(line)
+                text = "\n".join(out) + "\n"
+            elif path.lower().endswith(".md"):  # ours first, the remote's text kept below it
+                text = (ours.rstrip("\n") + "\n\n---\n\n# Previous content of this file on GitHub\n\n"
+                        + theirs.rstrip("\n") + "\n")
+            else:  # keep ours, keep theirs next to it
+                text, extra = ours, (path + ".remote", theirs)
+            with open(self.root / path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            self.git("add", path)
+            if extra:
+                with open(self.root / extra[0], "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(extra[1])
+                self.git("add", extra[0])
+        self.report(f"merge conflicts in {', '.join(ln[3:] for ln in unmerged)} resolved by keeping both versions.")
+        return True
+
+    def sync_with_remote(self):
+        """The remote already has work: merge it in (never force-push) and push again."""
+        self.say("The remote already has commits; merging them into main (no force push).")
+        f = self.run_git("fetch", "origin", "main")
+        if f.returncode != 0:
+            return f
+        m = self.run_git("merge", "origin/main", "--allow-unrelated-histories", "--no-edit",
+                         "-m", "Merge existing remote work")
+        if m.returncode != 0 and self.resolve_add_add():
+            m = self.run_git("commit", "--no-edit")
+        if m.returncode != 0:
+            conflicts = [ln for ln in m.stdout.splitlines() if "CONFLICT" in ln]
+            self.run_git("merge", "--abort")
+            m.stderr = ("merge conflict, nothing changed. Resolve by hand (git pull --allow-unrelated-histories "
+                        "origin main) then rerun. " + " | ".join(conflicts)[:300])
+            self.report(f"could not merge the existing remote work into main: {m.stderr[:200]}")
+            return m
+        self.report("merged the existing remote work into main (no force push).")
+        return self.run_git("push", "-u", "origin", "main")
 
     # one ticket
     def build(self, t):
@@ -382,12 +471,17 @@ class Builder:
             try:
                 text, provider = call_model(self.cfg, self.prompt(t, error), self.http)
                 used.append(provider)
+                raw = self.root / ".selfbuild" / f"last_response_{t['id']}.txt"
+                raw.parent.mkdir(parents=True, exist_ok=True)
+                raw.write_text(f"provider: {provider}\n\n{text}", encoding="utf-8")
                 files = self.validate(t, parse_files(text))
             except AllProvidersFailed as e:
                 return self._fail(t, state, base, branch, "waiting", f"no model reachable: {e}")
             except TicketError as e:
-                error = str(e)
-                self.say(f"  attempt {attempt}: rejected ({error})")
+                self.say(f"  attempt {attempt} via {used[-1]}: rejected ({e})")
+                self.say(f"    model said: {text.strip()[:160]!r}  (full text: {raw})")
+                error = (f"{e}\nUse EXACTLY this format for every file, with no markdown fences and no commentary:\n"
+                         "=== FILE: name.py ===\n<code>\n=== END FILE ===")
                 continue
             for name, content in files.items():
                 with open(self.root / name, "w", encoding="utf-8", newline="\n") as fh:
@@ -462,13 +556,20 @@ def main(argv=None, http=setup.real_http):
     p.add_argument("--no-push", action="store_true")
     p.add_argument("--retry-failed", action="store_true")
     args = p.parse_args(argv)
+    print(f"selfbuild {VERSION} - running from {ROOT}")
     cfg = setup.load_config(args.config)
     b = Builder(ROOT, cfg, http, push=not args.no_push)
     if args.dry_run:
         t = b.pick(args.retry_failed)
         print(b.prompt(t) if t else "No ready ticket left.")
         return 0
-    return 0 if b.run(once=args.once, retry_failed=args.retry_failed) >= 0 else 1
+    try:
+        b.run(once=args.once, retry_failed=args.retry_failed)
+    except RuntimeError as e:
+        print(f"\nStopped: {e}")
+        b.report(f"stopped: {str(e)[:200]}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

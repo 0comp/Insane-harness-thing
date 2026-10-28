@@ -55,6 +55,17 @@ class Unit(unittest.TestCase):
         text = "<think>plan</think>\n=== FILE: a.py ===\n```python\nx = 1\n```\n=== END FILE ===\n"
         self.assertEqual(sb.parse_files(text), {"a.py": "x = 1\n"})
 
+    def test_parse_files_tolerates_common_model_formats(self):
+        want = {"a.py": "x = 1\n", "test_a.py": "y = 2\n"}
+        no_end = "=== FILE: a.py ===\nx = 1\n=== FILE: test_a.py ===\ny = 2\n"
+        fenced_all = "```\n=== FILE: a.py ===\nx = 1\n=== END FILE ===\n=== FILE: test_a.py ===\ny = 2\n=== END FILE ===\n```"
+        markdown = "### FILE: a.py\n```python\nx = 1\n```\n### FILE: test_a.py\n```python\ny = 2\n```\n"
+        bold = "**FILE: `a.py`**\n```python\nx = 1\n```\n\n**FILE: `test_a.py`**\n```python\ny = 2\n```"
+        named = "Here is a.py:\n```python\nx = 1\n```\nAnd test_a.py:\n```python\ny = 2\n```"
+        for text in (no_end, fenced_all, markdown, bold, named):
+            self.assertEqual(sb.parse_files(text), want, text)
+        self.assertEqual(sb.parse_files("I cannot help with that."), {})
+
     def test_scan_secrets(self):
         self.assertTrue(sb.scan_secrets("k = 'gsk_" + "a" * 30 + "'"))
         self.assertTrue(sb.scan_secrets('api_key = "abcdefghijklmnopqrstuvwxyz"'))
@@ -144,6 +155,86 @@ class Router(unittest.TestCase):
         ok, why = sb.probe_local({"ollama_url": "http://localhost:2"}, self.http({}, "I cannot do that"))
         self.assertFalse(ok)
         self.assertIn("file format", why)
+
+
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class RemoteSync(unittest.TestCase):
+    """The first push meets a remote that already has commits."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.bare, self.seed, self.root = base / "remote.git", base / "seed", base / "work"
+        self.git(base, "init", "--bare", "-b", "main", str(self.bare))
+        self.git(base, "init", "-b", "main", str(self.seed))
+        self.git(self.seed, "remote", "add", "origin", str(self.bare))
+        (self.root / "tickets").mkdir(parents=True)
+        (self.root / "tickets" / "T01-x.md").write_text("id: T01\nfiles: a.py, test_a.py\n\nx")
+        sb._COOLDOWN.clear()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                              cwd=cwd, capture_output=True, text=True)
+
+    def seed_remote(self, name, text):
+        (self.seed / name).write_text(text)
+        self.git(self.seed, "add", name)
+        self.git(self.seed, "commit", "-m", "remote work")
+        self.git(self.seed, "push", "origin", "main")
+
+    def builder(self):
+        msgs = []
+        b = sb.Builder(self.root, {"github_repo": str(self.bare), "local_probe": False}, None,
+                       say=msgs.append)
+        b.msgs = msgs
+        return b
+
+    def test_merges_existing_remote_work_then_pushes(self):
+        self.seed_remote("REVIEW.md", "existing work\n")
+        b = self.builder()
+        b.ensure_repo()
+        tree = self.git(self.bare, "ls-tree", "-r", "--name-only", "main").stdout
+        self.assertIn("REVIEW.md", tree)        # remote work kept
+        self.assertIn("tickets/T01-x.md", tree)  # our bootstrap pushed on top
+        self.assertIn("Pushed main.", b.msgs)
+
+    def test_gitignore_and_readme_conflicts_keep_both_versions(self):
+        (self.root / "README.md").write_text("ours readme\n")
+        self.seed_remote(".gitignore", "something-else\n")
+        (self.seed / "README.md").write_text("remote readme\n")
+        self.git(self.seed, "add", "README.md")
+        self.git(self.seed, "commit", "-m", "readme")
+        self.git(self.seed, "push", "origin", "main")
+        b = self.builder()
+        b.ensure_repo()
+        self.assertIn("Pushed main.", b.msgs)
+        self.assertFalse((self.root / ".git" / "MERGE_HEAD").exists())
+        ignore = self.git(self.bare, "show", "main:.gitignore").stdout
+        self.assertIn("something-else", ignore)
+        self.assertIn(".selfbuild/", ignore)
+        readme = self.git(self.bare, "show", "main:README.md").stdout
+        self.assertIn("ours readme", readme)
+        self.assertIn("remote readme", readme)
+        self.assertEqual(self.git(self.root, "status", "--porcelain", "--untracked-files=no").stdout, "")
+
+    def test_other_conflicts_abort_cleanly(self):
+        # a file the remote deleted-vs-modified style conflict is hard to stage; check the guard directly
+        b = self.builder()
+        b.ensure_repo()
+        self.assertFalse(b.resolve_add_add())  # nothing unmerged -> refuses to "resolve"
+
+    def test_updated_selfbuild_files_are_committed_automatically(self):
+        b = self.builder()
+        b.ensure_repo()
+        (self.root / "tickets" / "T01-x.md").write_text("id: T01\nfiles: a.py, test_a.py\n\nupdated\n")
+        (self.root / "tickets" / "T02-y.md").write_text("id: T02\nfiles: b.py, test_b.py\n\nnew\n")
+        b.ensure_repo()
+        self.assertEqual(self.git(self.root, "status", "--porcelain", "--untracked-files=no").stdout, "")
+        self.assertIn("T02-y.md", self.git(self.root, "ls-files").stdout)
+        self.assertIn("Committed updated selfbuild files to main.", b.msgs)
 
 
 class Reporting(unittest.TestCase):
@@ -240,6 +331,14 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(b.run(), 2)
         self.assertEqual(self.show("ticket/T02-double:adder.py").stdout, GOOD_ADDER)  # stacked
         self.assertIn("def add", self.fake.prompts[1])  # dependency code given as context
+
+    def test_missing_files_message_shows_what_model_wrote(self):
+        b = self.builder(["Sorry, here is some prose.", reply()])
+        self.assertEqual(b.run(), 1)
+        self.assertIn("no recognisable file blocks", self.fake.prompts[1])
+        self.assertIn("=== FILE: name.py ===", self.fake.prompts[1])
+        raw = (self.root / ".selfbuild" / "last_response_T01.txt").read_text()
+        self.assertTrue(raw.startswith("provider: ollama"))
 
     def test_dirty_tree_aborts(self):
         b = self.builder([reply()])
