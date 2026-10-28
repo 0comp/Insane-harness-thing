@@ -1,0 +1,5 @@
+.selfbuild/
+__pycache__/
+*.pyc
+config.json
+.env
